@@ -317,4 +317,235 @@ from (select user_id,
       group by user_id) t1
 where array_contains(skus, '1')
   and array_contains(skus, '2')
-  and !array_contains(skus, '3')
+  and !array_contains(skus, '3');
+
+-- 19. 统计每日商品1和商品2销量的差值
+select create_date,
+       sum(if(sku_id = '1', sku_num, 0)) - sum(if(sku_id = '2', sku_num, 0)) as diff
+from order_detail
+where sku_id in ('1', '2')
+group by create_date
+order by create_date;
+
+-- 20. 查询出每个用户的最近三笔订单
+-- 查询字段: user_id | order_id | create_date
+select user_id,
+       order_id,
+       create_date
+from (select user_id,
+             order_id,
+             create_date,
+             row_number() over (partition by user_id order by create_date desc ) rn
+      from order_info) t1
+where rn <= 3;
+
+-- 21. 查询每个用户登录日期的最大空档期
+-- 从登录明细表（user_login_detail）中查询每个用户两个登录日期（以login_ts为准）之间的最大的空档期。统计最大空档期时，用户最后一次登录至今的空档也要考虑在内，假设今天为2021-10-10
+-- 查询字段: user_id | max_diff（最大空档期）
+
+select user_id,
+       max(diff) max_diff
+from (select user_id,
+             datediff(next_date, login_date) diff
+      from (select user_id,
+                   login_date,
+                   lead(login_date, 1, '2021-10-10') over (partition by user_id order by login_date) next_date
+            from (select user_id,
+                         to_date(login_ts) login_date
+                  from user_login_detail
+                  group by user_id, to_date(login_ts)) t1) t2) t3
+group by user_id
+order by user_id;
+
+-- 22. 查询相同时刻多地登陆的用户
+select distinct user_id
+from (select user_id,
+             if(pre_logout_ts is null, 1, if(pre_logout_ts < login_ts, 1, 0)) if_rep -- pre_logout_ts为null说明之前没有登录过
+      from (select user_id,
+                   login_ts,
+                   logout_ts,
+                   max(logout_ts)
+                       over (partition by user_id order by login_ts rows between unbounded preceding and 1 preceding) pre_logout_ts
+            from user_login_detail) t1) t2
+where if_rep = 0;
+-- 由于一个ip不可能出现logout_ts大于下一个login_ts的情况,所以一旦出现这种情况，就可以判定为异地登陆
+
+-- **23. 销售额完成任务指标的商品
+-- 商家要求每个商品每个月需要售卖出一定的销售总额 假设1号商品销售总额大于21000，2号商品销售总额大于10000，其余商品没有要求
+-- 从订单详情表中（order_detail）查询连续两个月销售总额大于等于任务总额的商品
+
+select sku_id
+from (select sku_id,
+             add_months(first_day, -row_number() over (partition by sku_id order by first_day)) month_continous
+      from (select sku_id,
+                   concat(date_format(create_date, 'yyyy-MM'), '-01') first_day,
+                   sum(sku_num * price)                               sku_amount
+            from order_detail
+            where sku_id in ('1', '2')
+            group by sku_id, concat(date_format(create_date, 'yyyy-MM'), '-01')
+            having (sku_id = '1' and sku_amount > 21000)
+                or (sku_id = '2' and sku_amount > 23000)) t1) t2
+group by sku_id
+having count(month_continous) >= 2;
+
+-- 24. 根据商品销售情况进行商品分类
+-- 从订单详情表中（order_detail）对销售件数对商品进行分类，0-5000为冷门商品，5001-19999位一般商品，20000往上为热门商品，并求出不同类别商品的数量
+-- 查询字段: Category（类型）| Cn（数量）
+
+select Category,
+       count(sku_id) Cn
+from (select case
+                 when sum_num <= 5000 then '冷门商品'
+                 when sum_num <= 19999 then '一般商品'
+                 else '热门商品'
+                 end Category,
+             sku_id
+      from (select sku_id,
+                   sum(sku_num) as sum_num
+            from order_detail
+            group by sku_id) t1) t2
+group by Category;
+
+-- 25. 各品类销量前三的所有商品
+-- 从订单详情表中（order_detail）和商品（sku_info）中查询各个品类销售数量前三的商品。如果该品类小于三个商品，则输出所有的商品销量
+
+select sku_id,
+       category_id
+from (select sku_id,
+             category_id,
+             row_number() over (partition by category_id order by sum_num desc) rn
+      from (select sku_info.sku_id,
+                   category_id,
+                   sum(sku_num) sum_num
+            from order_detail
+                     join sku_info on sku_info.sku_id = order_detail.sku_id
+            group by sku_info.sku_id, category_id) t1) t2
+where rn <= 3;
+
+-- **26. 各品类中商品价格的中位数
+-- 如果是偶数，则输出中间两个值的平均值;如果是奇数，则输出中间数即可
+-- 查询字段: Category_id（品类id） | Medprice（中位数）
+
+select category_id,
+       round(sum(`if`(rn = sku_num / 2 or rn = sku_num / 2 + 1, price, 0)) / 2, 1) Medprice
+from (select sku_id,
+             category_id,
+             price,
+             count(*) over (partition by category_id)                    sku_num,
+             count(*) over (partition by category_id) % 2                flag,
+             row_number() over (partition by category_id order by price) rn
+      from sku_info) t1
+where flag = 0
+group by category_id
+union
+select category_id,
+       round(sum(`if`(rn = ceil(sku_num / 2), price, 0)) / 2, 1) Medprice
+from (select sku_id,
+             category_id,
+             price,
+             count(*) over (partition by category_id)                    sku_num,
+             count(*) over (partition by category_id) % 2                flag,
+             row_number() over (partition by category_id order by price) rn
+      from sku_info) t1
+where flag = 1
+group by category_id;
+
+
+-- 27. 找出销售额连续3天超过100的商品
+
+select distinct sku_id
+from (select sku_id,
+             count(*) over (partition by sku_id,continous_flag) continous_count
+      from (select sku_id,
+                   date_sub(create_date, row_number() over (partition by sku_id order by create_date)) continous_flag
+            from (select sku_id,
+                         create_date,
+                         sum(sku_num * price) sum_num
+                  from order_detail
+                  group by sku_id, create_date
+                  having sum_num > 100) t1) t2) t3
+where continous_count >= 3;
+
+-- **28. 查询有新注册用户的当天的新用户数量、新用户的第一天留存率
+-- (首次登录算作当天新增，第二天也登录了算作一日留存)
+-- 查询字段: first_login（注册时间） | Register（新增用户数） | Retention（留存率）
+
+select first_login,
+       registe_user                  Register,
+       retention_user / registe_user Retention
+from (select first_login,
+             count(t1.user_id)  registe_user,
+             count(uld.user_id) retention_user
+      from (select user_id,
+                   min(to_date(login_ts)) first_login
+            from user_login_detail
+            group by user_id) t1
+               left join user_login_detail uld
+                         on t1.user_id = uld.user_id
+                             and datediff(to_date(uld.login_ts), first_login) = 1
+      group by first_login) t2;
+
+
+-- 29. 求出商品连续售卖的时间区间
+-- 查询字段: Sku_id（商品id） | Start_date（起始时间） | End_date（结束时间）
+
+select distinct sku_id,
+                first_value(create_date)
+                            over (partition by sku_id, continous_flag order by create_date rows between unbounded preceding and unbounded following) Start_date,
+                last_value(create_date)
+                           over (partition by sku_id, continous_flag order by create_date rows between unbounded preceding and unbounded following)  End_date
+from (select sku_id,
+             create_date,
+             date_sub(create_date, dense_rank() over (partition by sku_id order by create_date)) continous_flag
+      from order_detail
+      group by sku_id, create_date) t1
+order by sku_id;
+
+-- 需要注意:
+-- 1.之所以要在t1中使用group by sku_id, create_date，是为了去重
+-- 2.在选取first_value和last_value的时候，要注意窗口范围的限定: rows between unbounded preceding and unbounded following
+
+-- 30. 用户每天的登录次数及交易次数统计
+-- 查询字段: user_id | login_date | login_count | order_count
+
+select
+    t1.user_id,
+    login_date,
+    max(login_count) login_copunt,
+    count(oi.user_id) order_count
+from (select user_id,
+             to_date(login_ts) login_date,
+             count(*)          login_count
+      from user_login_detail
+      group by user_id, to_date(login_ts)) t1
+left join order_info oi on t1.user_id = oi.user_id
+and t1.login_date = oi.create_date
+group by t1.user_id,login_date
+order by t1.user_id;
+
+-- 31. 按年度列出每个商品销售总额
+-- 查询字段: Sku_id（商品id） | Year_date（年份） | Sku_sum（销售总额）
+select
+    sku_id,
+    year(create_date) year_date,
+    sum(price * sku_num) sku_sum
+from order_detail
+group by sku_id, year(create_date);
+
+-- 32. 查询某周内每件商品每天销售情况(销售数量)
+-- 从订单详情表（order_detail）中查询2021年9月27号-2021年10月3号这一周所有商品每天销售情况
+-- 查询字段: Sku_id（商品id）	Monday	Tuesday	Wednesday	Thursday	Friday	Saturday	Sunday
+select
+    sku_id,
+    sum(`if`(`dayofweek`(create_date) = 1,sku_num,0)) Sunday,
+    sum(`if`(`dayofweek`(create_date) = 2,sku_num,0)) Monday,
+    sum(`if`(`dayofweek`(create_date) = 3,sku_num,0)) Tuesday,
+    sum(`if`(`dayofweek`(create_date) = 4,sku_num,0)) Wednesday,
+    sum(`if`(`dayofweek`(create_date) = 5,sku_num,0)) Thursday,
+    sum(`if`(`dayofweek`(create_date) = 6,sku_num,0)) Friday,
+    sum(`if`(`dayofweek`(create_date) = 7,sku_num,0)) Saturday
+from order_detail
+where create_date >= '2021-09-27' and create_date <= '2021-10-03'
+group by sku_id;
+
+
