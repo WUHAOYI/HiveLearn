@@ -508,44 +508,225 @@ order by sku_id;
 -- 30. 用户每天的登录次数及交易次数统计
 -- 查询字段: user_id | login_date | login_count | order_count
 
-select
-    t1.user_id,
-    login_date,
-    max(login_count) login_copunt,
-    count(oi.user_id) order_count
+select t1.user_id,
+       login_date,
+       max(login_count)  login_copunt,
+       count(oi.user_id) order_count
 from (select user_id,
              to_date(login_ts) login_date,
              count(*)          login_count
       from user_login_detail
       group by user_id, to_date(login_ts)) t1
-left join order_info oi on t1.user_id = oi.user_id
-and t1.login_date = oi.create_date
-group by t1.user_id,login_date
+         left join order_info oi on t1.user_id = oi.user_id
+    and t1.login_date = oi.create_date
+group by t1.user_id, login_date
 order by t1.user_id;
 
 -- 31. 按年度列出每个商品销售总额
 -- 查询字段: Sku_id（商品id） | Year_date（年份） | Sku_sum（销售总额）
-select
-    sku_id,
-    year(create_date) year_date,
-    sum(price * sku_num) sku_sum
+select sku_id,
+       year(create_date)    year_date,
+       sum(price * sku_num) sku_sum
 from order_detail
 group by sku_id, year(create_date);
 
 -- 32. 查询某周内每件商品每天销售情况(销售数量)
 -- 从订单详情表（order_detail）中查询2021年9月27号-2021年10月3号这一周所有商品每天销售情况
 -- 查询字段: Sku_id（商品id）	Monday	Tuesday	Wednesday	Thursday	Friday	Saturday	Sunday
-select
-    sku_id,
-    sum(`if`(`dayofweek`(create_date) = 1,sku_num,0)) Sunday,
-    sum(`if`(`dayofweek`(create_date) = 2,sku_num,0)) Monday,
-    sum(`if`(`dayofweek`(create_date) = 3,sku_num,0)) Tuesday,
-    sum(`if`(`dayofweek`(create_date) = 4,sku_num,0)) Wednesday,
-    sum(`if`(`dayofweek`(create_date) = 5,sku_num,0)) Thursday,
-    sum(`if`(`dayofweek`(create_date) = 6,sku_num,0)) Friday,
-    sum(`if`(`dayofweek`(create_date) = 7,sku_num,0)) Saturday
+select sku_id,
+       sum(`if`(`dayofweek`(create_date) = 1, sku_num, 0)) Sunday,
+       sum(`if`(`dayofweek`(create_date) = 2, sku_num, 0)) Monday,
+       sum(`if`(`dayofweek`(create_date) = 3, sku_num, 0)) Tuesday,
+       sum(`if`(`dayofweek`(create_date) = 4, sku_num, 0)) Wednesday,
+       sum(`if`(`dayofweek`(create_date) = 5, sku_num, 0)) Thursday,
+       sum(`if`(`dayofweek`(create_date) = 6, sku_num, 0)) Friday,
+       sum(`if`(`dayofweek`(create_date) = 7, sku_num, 0)) Saturday
 from order_detail
-where create_date >= '2021-09-27' and create_date <= '2021-10-03'
+where create_date >= '2021-09-27'
+  and create_date <= '2021-10-03'
 group by sku_id;
 
+-- 33. 查看每件商品的售价涨幅情况
+-- 从商品价格变更明细表（sku_price_modify_detail），得到最近一次价格的涨幅情况，并按照涨幅升序排序
+-- 查询字段: Sku_id（商品id） | Price_change（涨幅）
 
+select sku_id,
+       price_change
+from (select sku_id,
+             change_date,
+             new_price - lead(new_price, 1, 0) over (partition by sku_id order by change_date desc) price_change,
+             row_number() over (partition by sku_id order by change_date desc )                     rn
+      from sku_price_modify_detail) t1
+where rn = 1
+order by price_change;
+
+-- 34. 销售订单首购和次购分析
+-- 通过商品信息表（sku_info）订单信息表（order_info）订单明细表（order_detail）
+-- 分析如果有一个用户成功下单两个及两个以上的购买成功的手机订单（购买商品为xiaomi 10，apple 12，小米13）
+-- 那么输出这个用户的id及第一次成功购买手机的日期和最后一次成功购买手机的日期，以及购买手机成功的次数
+-- 查询字段: User_id（用户id）　｜　First_date（首次时间）　｜　Last_value（末次时间）　｜　Cn（购买次数）
+select distinct user_id,
+                first_value(create_date)
+                            over (partition by user_id order by create_date rows between unbounded preceding and unbounded following) first_date,
+                last_value(create_date)
+                           over (partition by user_id order by create_date rows between unbounded preceding and unbounded following)  last_date,
+                count(*) over (partition by user_id order by create_date)                                                             cn
+from (select user_id,
+             od.create_date
+      from order_detail od
+               join sku_info si
+                    on od.sku_id = si.sku_id
+               join order_info oi
+                    on od.order_id = oi.order_id
+      where od.sku_id in ('1', '3', '4')) t1;
+
+-- 35. 同期商品售卖分析表
+-- 求出同一个商品在2021年和2022年中同一个月的售卖情况对比
+-- 查询字段: Sku_id（商品id）	Month（月份）	2020_skusum（2020销售量）	2021_skusum（2021销售量）
+
+select nvl(t1.sku_id, t2.sku_id),
+       month(nvl(t1.first_date, t2.first_date)) month,
+       nvl(t1.sku_sum, 0)                       2020_skusum,
+       nvl(t2.sku_sum, 0)                       2021_sku_sum
+from (select sku_id,
+             concat(date_format(create_date, 'yyyy-MM'), '-01') first_date,
+             sum(sku_num)                                       sku_sum
+      from order_detail
+      where year(create_date) = 2020
+      group by sku_id, concat(date_format(create_date, 'yyyy-MM'), '-01')) t1
+         full join
+     (select sku_id,
+             concat(date_format(create_date, 'yyyy-MM'), '-01') first_date,
+             sum(sku_num)                                       sku_sum
+      from order_detail
+      where year(create_date) = 2021
+      group by sku_id, concat(date_format(create_date, 'yyyy-MM'), '-01')) t2
+     on t1.sku_id = t2.sku_id and month(t1.first_date) = month(t2.first_date);
+
+-- 36. 国庆期间每个品类的商品的收藏量和购买量
+-- 从订单明细表（order_detail）和收藏信息表（favor_info）统计2021国庆期间，每个商品总收藏量和购买量
+-- 查询字段: Sku_id	Sku_sum（购买量）	Favor_cn（收藏量）
+select t1.sku_id,
+       sku_sum,
+       favor_cn
+from (select sku_id,
+             sum(sku_num) sku_sum
+      from order_detail
+      where create_date >= '2021-10-01'
+        and create_date <= '2021-10-07'
+      group by sku_id) t1
+         join
+     (select sku_id,
+             count(sku_id) favor_cn
+      from favor_info
+      where create_date >= '2021-10-01'
+        and create_date <= '2021-10-07'
+      group by sku_id) t2
+     on t1.sku_id = t2.sku_id;
+
+-- 37. 统计活跃间隔对用户分级结果
+-- 用户等级：
+-- 忠实用户：近7天活跃且非新用户
+-- 新晋用户：近7天新增
+-- 沉睡用户：近7天未活跃但是在7天前活跃
+-- 流失用户：近30天未活跃但是在30天前活跃
+-- 假设"今天"的含义是数据中所有日期的最大值，从用户登录明细表中的用户登录时间给各用户分级，求出各等级用户的人数
+-- 查询字段: Level（用户等级）	Cn（用户数量)
+
+select level,
+       count(*) as cn
+from (select case
+                 when to_date(max(login_ts)) <= date_sub(today, 30) then '流失用户' --最近一次登录时间为30天前
+                 when to_date(max(login_ts)) >= date_sub(today, 7) and
+                      to_date(min(login_ts)) <= date_sub(today, 7) --最近一次登录是7天内，但最早一次登录在7天前
+                     then '忠实用户'
+                 when to_date(min(login_ts)) >= date_sub(today, 7) then '新晋用户' --最早登录时间是7天内
+                 when to_date(max(login_ts)) <= date_sub(today, 7) and to_date(min(login_ts)) <= date_sub(today, 7)
+                     then '沉睡用户' --最近一次登录时间为7天前，最早一次登录也在7天前
+                 end level
+      from (select max(login_ts) today
+            from user_login_detail) t1
+               join user_login_detail uld
+                    on 1 = 1
+      group by user_id, today) t2
+group by level;
+
+-- 38. 求连续签到领金币数
+-- 用户每天签到可以领1金币，并可以累计签到天数，连续签到的第3、7天分别可以额外领2和6金币
+-- 每连续签到7天重新累积签到天数。
+-- 从用户登录明细表中求出每个用户金币总数，并按照金币总数倒序排序
+-- 查询字段: User_id（用户id）	Sum_coin_cn（金币总数)
+
+select user_id,
+       sum(coin_cn) sum_coin_cn
+from (select user_id,
+             max(count_continous) + sum(if(count_continous % 3 = 0, 2, 0)) +
+             sum(if(count_continous % 7 = 0, 6, 0)) coin_cn
+      from (select user_id,
+                   login_date,
+                   date_sub(login_date, rk)                                                          login_continous,
+                   count(*) over (partition by user_id,date_sub(login_date, rk) order by login_date) count_continous
+            from (select user_id,
+                         to_date(login_ts)                                             login_date, --签到以天为单位
+                         rank() over (partition by user_id order by to_date(login_ts)) rk
+                  from user_login_detail
+                  group by user_id, to_date(login_ts)) t1) t2
+      group by user_id, login_continous) t3
+group by user_id;
+
+-- 39. 求国庆期间的7日动销率和滞销率
+-- 动销率定义为品类商品中一段时间内有销量的商品占当前已上架总商品数的比例（有销量的商品/已上架总商品数）。
+-- 滞销率定义为品类商品中一段时间内没有销量的商品占当前已上架总商品数的比例。（没有销量的商品 / 已上架总商品数）
+-- 只要当天任一店铺有任何商品的销量就输出该天的结果
+select t2.category_id,
+       day1 / cn as  day1_churn,
+       1 - day1 / cn day1_slow,
+       day2 / cn as  day2_churn,
+       1 - day2 / cn day2_slow,
+       day3 / cn as  day3_churn,
+       1 - day3 / cn day3_slow,
+       day4 / cn as  day4_churn,
+       1 - day4 / cn day4_slow,
+       day5 / cn as  day5_churn,
+       1 - day5 / cn day5_slow,
+       day6 / cn as  day6_churn,
+       1 - day6 / cn day6_slow,
+       day7 / cn as  day7_churn,
+       1 - day7 / cn day7_slow
+from (select category_id, --求国庆期间有销量的商品
+             sum(`if`(create_date = '2021-10-01', 1, 0)) as day1,
+             sum(`if`(create_date = '2021-10-02', 1, 0)) as day2,
+             sum(`if`(create_date = '2021-10-03', 1, 0)) as day3,
+             sum(`if`(create_date = '2021-10-04', 1, 0)) as day4,
+             sum(`if`(create_date = '2021-10-05', 1, 0)) as day5,
+             sum(`if`(create_date = '2021-10-06', 1, 0)) as day6,
+             sum(`if`(create_date = '2021-10-07', 1, 0)) as day7
+      from (select distinct --统计粒度是有无销量，可能存在一个商品在一天内售卖多次的情况，因此需要去重
+                            od.sku_id,
+                            category_id,
+                            create_date
+            from order_detail od
+                     join sku_info si
+                          on od.sku_id = si.sku_id
+            where create_date >= '2021-10-01'
+              and create_date <= '2021-10-07') t1
+      group by category_id) t2
+         join
+     (select category_id,
+             count(*) cn
+      from sku_info
+      group by category_id) t3
+     on t2.category_id = t3.category_id;
+
+-- 40. 同时在线最多的人数
+select
+    max(number) cn
+from (select target_time,
+             sum(flag) over (order by target_time) number
+      from (select login_ts target_time,
+                   1        flag
+            from user_login_detail
+            union
+            select logout_ts target_time,
+                   -1        flag
+            from user_login_detail) t1) t2
